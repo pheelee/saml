@@ -36,7 +36,10 @@ type Session struct {
 	ExpireTime time.Time
 	Index      string
 
-	NameID                string
+	NameID       string
+	NameIDFormat string
+	SubjectID    string
+
 	Groups                []string
 	UserName              string
 	UserEmail             string
@@ -131,13 +134,21 @@ func (idp *IdentityProvider) Metadata() *EntityDescriptor {
 							{
 								Use: "signing",
 								KeyInfo: KeyInfo{
-									Certificate: certStr,
+									X509Data: X509Data{
+										X509Certificates: []X509Certificate{
+											{Data: certStr},
+										},
+									},
 								},
 							},
 							{
 								Use: "encryption",
 								KeyInfo: KeyInfo{
-									Certificate: certStr,
+									X509Data: X509Data{
+										X509Certificates: []X509Certificate{
+											{Data: certStr},
+										},
+									},
 								},
 								EncryptionMethods: []EncryptionMethod{
 									{Algorithm: "http://www.w3.org/2001/04/xmlenc#aes128-cbc"},
@@ -726,6 +737,19 @@ func (DefaultAssertionMaker) MakeAssertion(req *IdpAuthnRequest, session *Sessio
 		})
 	}
 
+	if session.SubjectID != "" {
+		attributes = append(attributes, Attribute{
+			Name:       "urn:oasis:names:tc:SAML:attribute:subject-id",
+			NameFormat: "urn:oasis:names:tc:SAML:2.0:attrname-format:uri",
+			Values: []AttributeValue{
+				{
+					Type:  "xs:string",
+					Value: session.SubjectID,
+				},
+			},
+		})
+	}
+
 	// allow for some clock skew in the validity period using the
 	// issuer's apparent clock.
 	notBefore := req.Now.Add(-1 * MaxClockSkew)
@@ -733,6 +757,12 @@ func (DefaultAssertionMaker) MakeAssertion(req *IdpAuthnRequest, session *Sessio
 	if notBefore.Before(req.Request.IssueInstant) {
 		notBefore = req.Request.IssueInstant
 		notOnOrAfterAfter = notBefore.Add(MaxIssueDelay)
+	}
+
+	nameIDFormat := "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"
+
+	if session.NameIDFormat != "" {
+		nameIDFormat = session.NameIDFormat
 	}
 
 	req.Assertion = &Assertion{
@@ -745,7 +775,7 @@ func (DefaultAssertionMaker) MakeAssertion(req *IdpAuthnRequest, session *Sessio
 		},
 		Subject: &Subject{
 			NameID: &NameID{
-				Format:          "urn:oasis:names:tc:SAML:2.0:nameid-format:transient",
+				Format:          nameIDFormat,
 				NameQualifier:   req.IDP.Metadata().EntityID,
 				SPNameQualifier: req.ServiceProviderMetadata.EntityID,
 				Value:           session.NameID,
@@ -854,7 +884,7 @@ func (req *IdpAuthnRequest) MakeAssertionEl() error {
 	encryptor := xmlenc.OAEP()
 	encryptor.BlockCipher = xmlenc.AES128CBC
 	encryptor.DigestMethod = &xmlenc.SHA1
-	encryptedDataEl, err := encryptor.Encrypt(certBuf, signedAssertionBuf)
+	encryptedDataEl, err := encryptor.Encrypt(certBuf, signedAssertionBuf, nil)
 	if err != nil {
 		return err
 	}
@@ -867,12 +897,23 @@ func (req *IdpAuthnRequest) MakeAssertionEl() error {
 	return nil
 }
 
-// WriteResponse writes the `Response` to the http.ResponseWriter. If
-// `Response` is not already set, it calls MakeResponse to produce it.
-func (req *IdpAuthnRequest) WriteResponse(w http.ResponseWriter) error {
+// IdpAuthnRequestForm contans HTML form information to be submitted to the
+// SAML HTTP POST binding ACS.
+type IdpAuthnRequestForm struct {
+	URL          string
+	SAMLResponse string
+	RelayState   string
+}
+
+// PostBinding creates the HTTP POST form information for this
+// `IdpAuthnRequest`. If `Response` is not already set, it calls MakeResponse
+// to produce it.
+func (req *IdpAuthnRequest) PostBinding() (IdpAuthnRequestForm, error) {
+	var form IdpAuthnRequestForm
+
 	if req.ResponseEl == nil {
 		if err := req.MakeResponse(); err != nil {
-			return err
+			return form, err
 		}
 	}
 
@@ -880,45 +921,48 @@ func (req *IdpAuthnRequest) WriteResponse(w http.ResponseWriter) error {
 	doc.SetRoot(req.ResponseEl)
 	responseBuf, err := doc.WriteToBytes()
 	if err != nil {
-		return err
+		return form, err
 	}
 
-	// the only supported binding is the HTTP-POST binding
-	switch req.ACSEndpoint.Binding {
-	case HTTPPostBinding:
-		tmpl := template.Must(template.New("saml-post-form").Parse(`<html>` +
-			`<form method="post" action="{{.URL}}" id="SAMLResponseForm">` +
-			`<input type="hidden" name="SAMLResponse" value="{{.SAMLResponse}}" />` +
-			`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
-			`<input id="SAMLSubmitButton" type="submit" value="Continue" />` +
-			`</form>` +
-			`<script>document.getElementById('SAMLSubmitButton').style.visibility='hidden';</script>` +
-			`<script>document.getElementById('SAMLResponseForm').submit();</script>` +
-			`</html>`))
-		data := struct {
-			URL          string
-			SAMLResponse string
-			RelayState   string
-		}{
-			URL:          req.ACSEndpoint.Location,
-			SAMLResponse: base64.StdEncoding.EncodeToString(responseBuf),
-			RelayState:   req.RelayState,
-		}
-
-		buf := bytes.NewBuffer(nil)
-		if err := tmpl.Execute(buf, data); err != nil {
-			return err
-		}
-		if _, err := io.Copy(w, buf); err != nil {
-			return err
-		}
-		return nil
-
-	default:
-		return fmt.Errorf("%s: unsupported binding %s",
+	if req.ACSEndpoint.Binding != HTTPPostBinding {
+		return form, fmt.Errorf("%s: unsupported binding %s",
 			req.ServiceProviderMetadata.EntityID,
 			req.ACSEndpoint.Binding)
 	}
+
+	form.URL = req.ACSEndpoint.Location
+	form.SAMLResponse = base64.StdEncoding.EncodeToString(responseBuf)
+	form.RelayState = req.RelayState
+
+	return form, nil
+}
+
+// WriteResponse writes the `Response` to the http.ResponseWriter. If
+// `Response` is not already set, it calls MakeResponse to produce it.
+func (req *IdpAuthnRequest) WriteResponse(w http.ResponseWriter) error {
+	form, err := req.PostBinding()
+	if err != nil {
+		return err
+	}
+
+	tmpl := template.Must(template.New("saml-post-form").Parse(`<html>` +
+		`<form method="post" action="{{.URL}}" id="SAMLResponseForm">` +
+		`<input type="hidden" name="SAMLResponse" value="{{.SAMLResponse}}" />` +
+		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
+		`<input id="SAMLSubmitButton" type="submit" value="Continue" />` +
+		`</form>` +
+		`<script>document.getElementById('SAMLSubmitButton').style.visibility='hidden';</script>` +
+		`<script>document.getElementById('SAMLResponseForm').submit();</script>` +
+		`</html>`))
+
+	buf := bytes.NewBuffer(nil)
+	if err := tmpl.Execute(buf, form); err != nil {
+		return err
+	}
+	if _, err := io.Copy(w, buf); err != nil {
+		return err
+	}
+	return nil
 }
 
 // getSPEncryptionCert returns the certificate which we can use to encrypt things
@@ -927,7 +971,7 @@ func (req *IdpAuthnRequest) getSPEncryptionCert() (*x509.Certificate, error) {
 	certStr := ""
 	for _, keyDescriptor := range req.SPSSODescriptor.KeyDescriptors {
 		if keyDescriptor.Use == "encryption" {
-			certStr = keyDescriptor.KeyInfo.Certificate
+			certStr = keyDescriptor.KeyInfo.X509Data.X509Certificates[0].Data
 			break
 		}
 	}
@@ -936,8 +980,8 @@ func (req *IdpAuthnRequest) getSPEncryptionCert() (*x509.Certificate, error) {
 	// non-empty cert we find.
 	if certStr == "" {
 		for _, keyDescriptor := range req.SPSSODescriptor.KeyDescriptors {
-			if keyDescriptor.Use == "" && keyDescriptor.KeyInfo.Certificate != "" {
-				certStr = keyDescriptor.KeyInfo.Certificate
+			if keyDescriptor.Use == "" && len(keyDescriptor.KeyInfo.X509Data.X509Certificates) != 0 && keyDescriptor.KeyInfo.X509Data.X509Certificates[0].Data != "" {
+				certStr = keyDescriptor.KeyInfo.X509Data.X509Certificates[0].Data
 				break
 			}
 		}
