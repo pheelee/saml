@@ -1,7 +1,7 @@
 package samlsp
 
 import (
-	"crypto/rsa"
+	"crypto"
 	"fmt"
 	"time"
 
@@ -10,22 +10,20 @@ import (
 	"github.com/crewjam/saml"
 )
 
-var defaultJWTSigningMethod = jwt.SigningMethodRS256
-
 // JWTTrackedRequestCodec encodes TrackedRequests as signed JWTs
 type JWTTrackedRequestCodec struct {
 	SigningMethod jwt.SigningMethod
 	Audience      string
 	Issuer        string
 	MaxAge        time.Duration
-	Key           *rsa.PrivateKey
+	Key           crypto.Signer
 }
 
 var _ TrackedRequestCodec = JWTTrackedRequestCodec{}
 
 // JWTTrackedRequestClaims represents the JWT claims for a tracked request.
 type JWTTrackedRequestClaims struct {
-	jwt.StandardClaims
+	jwt.RegisteredClaims
 	TrackedRequest
 	SAMLAuthnRequest bool `json:"saml-authn-request"`
 }
@@ -34,12 +32,12 @@ type JWTTrackedRequestClaims struct {
 func (s JWTTrackedRequestCodec) Encode(value TrackedRequest) (string, error) {
 	now := saml.TimeNow()
 	claims := JWTTrackedRequestClaims{
-		StandardClaims: jwt.StandardClaims{
-			Audience:  s.Audience,
-			ExpiresAt: now.Add(s.MaxAge).Unix(),
-			IssuedAt:  now.Unix(),
+		RegisteredClaims: jwt.RegisteredClaims{
+			Audience:  jwt.ClaimStrings{s.Audience},
+			ExpiresAt: jwt.NewNumericDate(now.Add(s.MaxAge)),
+			IssuedAt:  jwt.NewNumericDate(now),
 			Issuer:    s.Issuer,
-			NotBefore: now.Unix(), // TODO(ross): correct for clock skew
+			NotBefore: jwt.NewNumericDate(now), // TODO(ross): correct for clock skew
 			Subject:   value.Index,
 		},
 		TrackedRequest:   value,
@@ -67,9 +65,9 @@ func (s JWTTrackedRequestCodec) Decode(signed string) (*TrackedRequest, error) {
 	if !claims.VerifyIssuer(s.Issuer, true) {
 		return nil, fmt.Errorf("expected issuer %q, got %q", s.Issuer, claims.Issuer)
 	}
-	if claims.SAMLAuthnRequest != true {
+	if !claims.SAMLAuthnRequest {
 		return nil, fmt.Errorf("expected saml-authn-request")
 	}
-	claims.TrackedRequest.Index = claims.Subject
+	claims.Index = claims.Subject
 	return &claims.TrackedRequest, nil
 }
